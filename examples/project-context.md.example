@@ -1,0 +1,61 @@
+# Example Project — Project Context (Sentinel)
+
+> This is a sample `project-context.md` for a typical Expo + Supabase mobile app.
+> Copy this to your project root, rename to `project-context.md`, and edit the
+> sections to match your actual data, roles, compliance posture, and risk surface.
+> The MCP auto-loads this file on every audit pass.
+>
+> Last updated: 2026-01-15
+
+---
+
+## SENSITIVE_FIELDS
+
+- `users.email` — GDPR/PII — never logged, never in analytics events, never in a URL
+- `users.display_name` — PII — never logged, never in analytics events
+- `users.phone` — PII — masked in UI, never logged, only collected with explicit consent
+- `auth.access_token` — auth credential — SecureStore only, never AsyncStorage, never logged
+- `auth.refresh_token` — auth credential — SecureStore only, never logged
+- `supabase.anon_key` + `supabase.url` — credentials — env var only, never hardcoded
+- `oauth.google_client_id` + Apple Sign-In credentials — credentials — env var only
+- `analytics.event_payloads` — PII risk — scrub email and display_name before sending; hashed user_id only
+- `sentry.error_context` — PII risk — scrub PII from breadcrumbs and error messages
+- `push.device_token` — FCM/APNs token — never logged publicly
+
+---
+
+## USER_ROLES
+
+- `user` — default, self-data access only (Row-Level Security enforced in Supabase)
+- `admin` — full access to user data and audit logs. Web admin console only; no in-app surface yet.
+- `support` — read-only access to user profile + session history. Web admin console only.
+
+---
+
+## COMPLIANCE_REQUIREMENTS
+
+- GDPR — EU users have right to export and right to deletion; must be designed in from auth onwards
+- CCPA — California users have right to know and right to delete
+- Apple App Store Privacy Labels — must be completed before first TestFlight submission
+- Google Play Data Safety Form — must be completed before first Play Console submission
+- SOC 2 Type II — if selling to enterprise customers (deferred until first enterprise prospect)
+
+---
+
+## HIGH_RISK_FEATURES
+
+- Auth flow — email/password, Google OAuth, Apple Sign-In, password reset (Supabase Auth)
+- Supabase client initialization and Row-Level Security policies (RLS is the primary DB-level access control)
+- `expo-secure-store` read/write patterns for session/refresh tokens
+- Push notification device token registration (FCM + APNs)
+- Deep links for password reset and email verification (Universal Links / App Links — NOT custom URL schemes)
+- Third-party SDK integrations: PostHog (analytics), Sentry (error reporting)
+- [DEFERRED] In-app purchases / subscriptions — re-scope before any payment code is written
+
+---
+
+## AUDIT HISTORY
+
+| Date | Trigger | Findings | Status |
+|---|---|---|---|
+| 2026-01-15 | baseline | _(pending first Sentinel scan)_ | _(pending verdict)_ |

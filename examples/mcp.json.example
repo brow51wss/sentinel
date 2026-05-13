@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy the 'sentinel' entry below into ~/.cursor/mcp.json (or your MCP client's equivalent config file). Replace /absolute/path/to/sentinel with the real path where you cloned this repo. If mcp.json already has a mcpServers object with other entries, merge — don't overwrite.",
+  "mcpServers": {
+    "sentinel": {
+      "command": "/absolute/path/to/sentinel/.venv/bin/python",
+      "args": ["/absolute/path/to/sentinel/sentinel_mcp.py"]
+    }
+  }
+}
