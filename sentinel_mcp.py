@@ -873,6 +873,14 @@ INJECTION_PATTERNS = [
     (r"(?:password|passwd|pwd|admin_?password)\s*[:=]\s*['\"](?:admin|password|123456|12345678|qwerty|letmein|welcome|test|test1234|changeme|default|root)['\"]", "HIGH", "credentials.hardcoded_default",
      "Hardcoded default/admin/test password in source",
      "Remove the hardcoded credential. Default credentials in source ship to production and are commonly tried by attackers. If this is a seed value for tests, move it into a test fixture directory (which Sentinel skips) and clearly name it as such."),
+
+    # ---- Hardcoded string used as route access gate ----
+    (r"req\.query\.\w+\s*!==?\s*['\"][A-Za-z0-9_\-]{4,30}['\"]", "HIGH", "auth.hardcoded_route_guard",
+     "Hardcoded string used as route access gate (query param comparison)",
+     "Replace the hardcoded access string with proper authentication. A literal string committed "
+     "to source code is not a secret — anyone with repo read access has it. It also appears in "
+     "plaintext in server access logs when passed as a query param. Use Supabase/JWT Bearer token "
+     "auth and verify the caller's role instead."),
 ]
 _compiled_injection = [
     (re.compile(pat), sev, rule, title, tell)
@@ -1266,6 +1274,157 @@ def _check_screen_capture_protection(root: Path, context: dict):
     }]
 
 
+# ---- Security headers absence check (Next.js / web projects) ----
+
+_REQUIRED_SECURITY_HEADERS = [
+    ("Content-Security-Policy", "HIGH", "headers.csp_missing",
+     "Content-Security-Policy header not configured",
+     "Add a Content-Security-Policy header in next.config.js headers() or middleware.ts. "
+     "Without CSP, injected scripts execute freely in the browser. For Next.js, use a "
+     "nonce-based policy via middleware.ts and pass the nonce to Script/style tags. "
+     "At minimum: default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'."),
+    ("Strict-Transport-Security", "MEDIUM", "headers.hsts_missing",
+     "Strict-Transport-Security (HSTS) header not configured",
+     "Add `Strict-Transport-Security: max-age=63072000; includeSubDomains` to next.config.js "
+     "headers(). Without HSTS, browsers do not enforce HTTPS on return visits and downgrade "
+     "attacks are possible."),
+    ("X-Frame-Options", "MEDIUM", "headers.xfo_missing",
+     "X-Frame-Options header not configured",
+     "Add `X-Frame-Options: DENY` to next.config.js headers(). Without it, the app can be "
+     "embedded in an iframe on any domain — enabling clickjacking attacks that trick users "
+     "into clicking UI elements (e.g., submitting forms) without realising it."),
+    ("X-Content-Type-Options", "MEDIUM", "headers.xcto_missing",
+     "X-Content-Type-Options header not configured",
+     "Add `X-Content-Type-Options: nosniff` to next.config.js headers(). Without it, "
+     "browsers may MIME-sniff responses and treat a plain-text file as JavaScript."),
+    ("Referrer-Policy", "MEDIUM", "headers.referrer_missing",
+     "Referrer-Policy header not configured",
+     "Add `Referrer-Policy: strict-origin-when-cross-origin` to next.config.js headers(). "
+     "Without it, the full URL of the current page (which may contain sensitive IDs) is sent "
+     "as a Referer header to any external resource loaded by the page."),
+]
+
+
+def _check_security_headers(root: Path):
+    """Flag missing security headers in Next.js projects.
+    Checks next.config.js, next.config.ts, middleware.ts, and middleware.js.
+    Only fires for Next.js projects (next.config.* must exist).
+    """
+    has_nextconfig = (root / "next.config.js").exists() or (root / "next.config.ts").exists()
+    if not has_nextconfig:
+        return []
+
+    combined_text = ""
+    for fname in ["next.config.js", "next.config.ts", "middleware.ts", "middleware.js"]:
+        f = root / fname
+        if f.exists():
+            try:
+                combined_text += f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+
+    findings = []
+    for header_name, severity, rule, title, tell in _REQUIRED_SECURITY_HEADERS:
+        if header_name.lower() not in combined_text.lower():
+            findings.append({
+                "severity": severity,
+                "rule": rule,
+                "title": title,
+                "file": "next.config.js",
+                "line": 0,
+                "excerpt": f"('{header_name}' not found in next.config.js or middleware.ts)",
+                "tell_cursor": tell,
+            })
+    return findings
+
+
+# ---- Rate limiting absence check (web API projects) ----
+
+_RATE_LIMIT_HINTS = re.compile(
+    r"\b(?:upstash/ratelimit|@upstash/ratelimit|express-rate-limit|rate-limiter-flexible|"
+    r"bottleneck|p-limit|ratelimit|RateLimit|rateLimiter|rate_limit)\b",
+    re.IGNORECASE,
+)
+
+
+def _check_rate_limiting(root: Path):
+    """Flag if no rate limiting library is detected in a project with API routes.
+    Checks package.json dependencies and middleware.ts/middleware.js for usage hints.
+    Only fires when pages/api or app/api directories exist.
+    """
+    api_dir = root / "pages" / "api"
+    app_api = root / "app" / "api"
+    if not api_dir.exists() and not app_api.exists():
+        return []
+
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            if _RATE_LIMIT_HINTS.search(pkg.read_text(encoding="utf-8", errors="ignore")):
+                return []
+        except Exception:
+            pass
+
+    for fname in ["middleware.ts", "middleware.js"]:
+        f = root / fname
+        if f.exists():
+            try:
+                if _RATE_LIMIT_HINTS.search(f.read_text(encoding="utf-8", errors="ignore")):
+                    return []
+            except Exception:
+                pass
+
+    return [{
+        "severity": "HIGH",
+        "rule": "security.rate_limiting_absent",
+        "title": "No rate limiting library detected in API project",
+        "file": "package.json",
+        "line": 0,
+        "excerpt": "(no @upstash/ratelimit / express-rate-limit / rate-limiter-flexible / similar found)",
+        "tell_cursor": (
+            "Add rate limiting to protect API routes from brute force, credential stuffing, "
+            "email bombing, and database connection exhaustion. For Next.js on Vercel, "
+            "@upstash/ratelimit with @upstash/redis is the standard approach — it runs at "
+            "the edge and survives serverless cold starts. Apply stricter limits to auth and "
+            "email-sending routes; more lenient limits to general data routes."
+        ),
+    }]
+
+
+# ---- middleware.ts absence check (Next.js projects with API routes) ----
+
+def _check_nextjs_middleware_absent(root: Path):
+    """Flag if a Next.js project with API routes has no middleware.ts.
+    middleware.ts is where security headers, rate limiting, and auth redirects live.
+    Only fires for Next.js projects that also have an API route directory.
+    """
+    has_nextconfig = (root / "next.config.js").exists() or (root / "next.config.ts").exists()
+    if not has_nextconfig:
+        return []
+    if (root / "middleware.ts").exists() or (root / "middleware.js").exists():
+        return []
+    api_dir = root / "pages" / "api"
+    app_api = root / "app" / "api"
+    if not api_dir.exists() and not app_api.exists():
+        return []
+    return [{
+        "severity": "HIGH",
+        "rule": "nextjs.middleware_absent",
+        "title": "No middleware.ts found in Next.js project with API routes",
+        "file": "(project root)",
+        "line": 0,
+        "excerpt": "(middleware.ts / middleware.js not found at project root)",
+        "tell_cursor": (
+            "Create middleware.ts at the project root. This is the standard Next.js location "
+            "for security headers (CSP, HSTS, X-Frame-Options), rate limiting, and auth redirect "
+            "logic that applies to all routes. Without it, these protections must be applied "
+            "manually in every route handler — which is error-prone and easily missed. "
+            "Note: middleware.ts is for routing/UX/headers — do NOT use it as your only auth "
+            "gate. Re-verify authentication inside each route handler or data access layer."
+        ),
+    }]
+
+
 # ---- Permissions audit (OWASP Mobile M6 Privacy Controls) ----
 
 DANGEROUS_IOS_USAGE_KEYS = [
@@ -1425,7 +1584,7 @@ UPLOAD_HINTS = re.compile(
 )
 
 
-def _gather_api_routes(root: Path, max_routes: int = 30, head_lines: int = 25):
+def _gather_api_routes(root: Path, max_routes: int = 100, head_lines: int = 25):
     routes = []
     for path in _walk_source_files(root):
         rel = str(path.relative_to(root))
@@ -1965,6 +2124,24 @@ def sentinel_pass2_audit(
     findings.extend(screen_hits)
     if not screen_hits and context.get("found") and context.get("sensitive_fields"):
         passed.append("Screen-capture/recording protection found in code (sensitive screens can opt in).")
+
+    # --- Security headers (Next.js / web projects) ---
+    header_hits = _check_security_headers(root)
+    findings.extend(header_hits)
+    if not header_hits and ((root / "next.config.js").exists() or (root / "next.config.ts").exists()):
+        passed.append("Required security headers (CSP, HSTS, X-Frame-Options, etc.) found in config.")
+
+    # --- Rate limiting ---
+    rate_hits = _check_rate_limiting(root)
+    findings.extend(rate_hits)
+    if not rate_hits:
+        passed.append("Rate limiting library detected.")
+
+    # --- middleware.ts presence (Next.js) ---
+    mw_hits = _check_nextjs_middleware_absent(root)
+    findings.extend(mw_hits)
+    if not mw_hits and ((root / "middleware.ts").exists() or (root / "middleware.js").exists()):
+        passed.append("middleware.ts present — security headers and rate limiting can be applied globally.")
 
     # --- Gather context for LLM judgment ---
     routes = _gather_api_routes(root)
