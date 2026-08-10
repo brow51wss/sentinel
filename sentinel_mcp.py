@@ -875,12 +875,29 @@ INJECTION_PATTERNS = [
      "Remove the hardcoded credential. Default credentials in source ship to production and are commonly tried by attackers. If this is a seed value for tests, move it into a test fixture directory (which Sentinel skips) and clearly name it as such."),
 
     # ---- Hardcoded string used as route access gate ----
+    # Catches direct literal comparison: req.query.code !== 'ABC123'
     (r"req\.query\.\w+\s*!==?\s*['\"][A-Za-z0-9_\-]{4,30}['\"]", "HIGH", "auth.hardcoded_route_guard",
      "Hardcoded string used as route access gate (query param comparison)",
      "Replace the hardcoded access string with proper authentication. A literal string committed "
      "to source code is not a secret — anyone with repo read access has it. It also appears in "
      "plaintext in server access logs when passed as a query param. Use Supabase/JWT Bearer token "
      "auth and verify the caller's role instead."),
+    # Catches indirect variable assignment: const ACCESS_CODE = 'ABC123'
+    (r"(?:const|let|var)\s+[A-Z_]{4,30}\s*=\s*['\"][A-Za-z0-9_\-]{4,20}['\"]", "HIGH",
+     "auth.hardcoded_route_guard_variable",
+     "Short uppercase constant assigned a literal string — possible hardcoded access gate",
+     "If this constant is used to gate route access (compared against req.query or req.body), "
+     "replace it with proper authentication. Literal strings in source code are not secrets — "
+     "anyone with repo read access can read the value. Use Supabase/JWT Bearer token auth instead."),
+
+    # ---- Weak password minimum length policy ----
+    (r"password\b.{0,30}\.length\s*<\s*([1-9]|1[01])\b", "HIGH", "auth.weak_password_minimum",
+     "Password minimum length below 12 characters",
+     "Increase the password minimum length to at least 12 characters for any app handling "
+     "sensitive data. NIST SP 800-63B recommends 8 as an absolute minimum; healthcare and "
+     "financial applications should use 12+. A 6-character minimum can be brute-forced offline "
+     "in seconds with modern hardware. Update the validation check and communicate the new "
+     "requirement to existing users."),
 ]
 _compiled_injection = [
     (re.compile(pat), sev, rule, title, tell)
@@ -1423,6 +1440,109 @@ def _check_nextjs_middleware_absent(root: Path):
             "gate. Re-verify authentication inside each route handler or data access layer."
         ),
     }]
+
+
+# ---- Service role key used in routes that lack auth checks ----
+
+_SERVICE_ROLE_HINTS = re.compile(
+    r"SUPABASE_SERVICE_ROLE_KEY|supabase_service_role|serviceRoleKey|service_role_key",
+    re.IGNORECASE,
+)
+_AUTH_CHECK_HINTS = re.compile(
+    r"authorization|Bearer|req\.headers\.auth|getUser|verifyJWT|resolveCallerFromToken",
+    re.IGNORECASE,
+)
+
+
+def _check_service_role_in_public_routes(root: Path):
+    """Flag API route files that use the Supabase service role key without any
+    Authorization header check. The service role key bypasses all RLS policies —
+    using it in a route with no auth check means any unauthenticated caller can
+    trigger that route with elevated database privileges.
+    Only scans pages/api and app/api directories.
+    """
+    api_dirs = [root / "pages" / "api", root / "app" / "api"]
+    findings = []
+
+    for api_dir in api_dirs:
+        if not api_dir.exists():
+            continue
+        for path in api_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+                continue
+            rel = str(path.relative_to(root))
+            if _is_likely_test_file(rel):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if not _SERVICE_ROLE_HINTS.search(text):
+                continue
+            if _AUTH_CHECK_HINTS.search(text):
+                continue
+            findings.append({
+                "severity": "HIGH",
+                "rule": "auth.service_role_in_unauthed_route",
+                "title": "Supabase service role key used in route with no auth check",
+                "file": rel,
+                "line": 0,
+                "excerpt": "(service role key present; no Authorization/Bearer/getUser check found)",
+                "tell_cursor": (
+                    f"The file `{rel}` uses the Supabase service role key, which bypasses all "
+                    "RLS policies, but has no Authorization header check or session verification. "
+                    "Any unauthenticated caller can trigger this route with full database access. "
+                    "Either add a Bearer token auth check and verify the caller's role, or replace "
+                    "the service role key with the anon key if elevated privileges are not needed."
+                ),
+            })
+    return findings
+
+
+# ---- S3 presigned URLs without file size constraints ----
+
+_PRESIGNED_URL_HINTS = re.compile(r"getSignedUrl\s*\(", re.IGNORECASE)
+_CONTENT_LENGTH_HINTS = re.compile(r"ContentLengthRange|content.length.range", re.IGNORECASE)
+
+
+def _check_presigned_url_no_size_limit(root: Path):
+    """Flag files that generate S3 presigned upload URLs without a ContentLengthRange
+    condition. Without a size constraint, any authenticated user can upload arbitrarily
+    large files, causing unbounded S3 storage and transfer costs.
+    """
+    findings = []
+    for path in _walk_source_files(root):
+        rel = str(path.relative_to(root))
+        if _is_likely_test_file(rel):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not _PRESIGNED_URL_HINTS.search(text):
+            continue
+        if _CONTENT_LENGTH_HINTS.search(text):
+            continue
+        findings.append({
+            "severity": "MEDIUM",
+            "rule": "storage.presigned_url_no_size_limit",
+            "title": "S3 presigned upload URL generated without ContentLengthRange constraint",
+            "file": rel,
+            "line": 0,
+            "excerpt": "(getSignedUrl found; no ContentLengthRange condition detected)",
+            "tell_cursor": (
+                f"`{rel}` generates a presigned S3 upload URL with no file size limit. "
+                "An authenticated user can upload arbitrarily large files, causing unbounded "
+                "storage costs and potential denial-of-service. Add a ContentLengthRange "
+                "condition to the presigned POST policy (requires switching from presigned "
+                "PUT to presigned POST). Example: `Conditions: [['content-length-range', 1, 10485760]]` "
+                "limits uploads to 10MB. Set the limit appropriate to the field "
+                "(e.g. 10MB for patient photos, 1MB for signatures)."
+            ),
+        })
+    return findings
 
 
 # ---- Permissions audit (OWASP Mobile M6 Privacy Controls) ----
@@ -2142,6 +2262,18 @@ def sentinel_pass2_audit(
     findings.extend(mw_hits)
     if not mw_hits and ((root / "middleware.ts").exists() or (root / "middleware.js").exists()):
         passed.append("middleware.ts present — security headers and rate limiting can be applied globally.")
+
+    # --- Service role key in unauthenticated routes ---
+    svc_hits = _check_service_role_in_public_routes(root)
+    findings.extend(svc_hits)
+    if not svc_hits:
+        passed.append("No service role key usage detected in unauthenticated API routes.")
+
+    # --- S3 presigned URLs without size constraints ---
+    presigned_hits = _check_presigned_url_no_size_limit(root)
+    findings.extend(presigned_hits)
+    if not presigned_hits:
+        passed.append("S3 presigned URL size constraints detected or no presigned URLs in use.")
 
     # --- Gather context for LLM judgment ---
     routes = _gather_api_routes(root)
