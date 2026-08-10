@@ -1319,13 +1319,22 @@ _REQUIRED_SECURITY_HEADERS = [
      "Add `Referrer-Policy: strict-origin-when-cross-origin` to next.config.js headers(). "
      "Without it, the full URL of the current page (which may contain sensitive IDs) is sent "
      "as a Referer header to any external resource loaded by the page."),
+    ("Permissions-Policy", "LOW", "headers.permissions_policy_missing",
+     "Permissions-Policy header not configured",
+     "Add `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()` to "
+     "next.config.js headers(). Without it, browser features are unrestricted — any script "
+     "on the page can request camera, microphone, or location access. For a healthcare app, "
+     "explicitly disabling unused features is a defense-in-depth measure."),
 ]
+
+_HSTS_INCLUDE_SUBDOMAINS = re.compile(r"includeSubDomains", re.IGNORECASE)
 
 
 def _check_security_headers(root: Path):
     """Flag missing security headers in Next.js projects.
     Checks next.config.js, next.config.ts, middleware.ts, and middleware.js.
     Only fires for Next.js projects (next.config.* must exist).
+    Also checks that HSTS includes the includeSubDomains directive when present.
     """
     has_nextconfig = (root / "next.config.js").exists() or (root / "next.config.ts").exists()
     if not has_nextconfig:
@@ -1351,6 +1360,25 @@ def _check_security_headers(root: Path):
                 "line": 0,
                 "excerpt": f"('{header_name}' not found in next.config.js or middleware.ts)",
                 "tell_cursor": tell,
+            })
+
+    # Check HSTS value quality — if HSTS is present but missing includeSubDomains, flag it
+    if "strict-transport-security" in combined_text.lower():
+        if not _HSTS_INCLUDE_SUBDOMAINS.search(combined_text):
+            findings.append({
+                "severity": "LOW",
+                "rule": "headers.hsts_no_subdomains",
+                "title": "Strict-Transport-Security present but missing `includeSubDomains`",
+                "file": "next.config.js",
+                "line": 0,
+                "excerpt": "(Strict-Transport-Security found; includeSubDomains not present)",
+                "tell_cursor": (
+                    "Update your HSTS header to include `includeSubDomains`: "
+                    "`Strict-Transport-Security: max-age=63072000; includeSubDomains`. "
+                    "Without it, subdomains can still be accessed over plain HTTP, which "
+                    "opens the door to cookie hijacking and protocol downgrade attacks on "
+                    "those subdomains."
+                ),
             })
     return findings
 
