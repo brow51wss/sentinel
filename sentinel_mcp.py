@@ -873,6 +873,104 @@ INJECTION_PATTERNS = [
     (r"(?:password|passwd|pwd|admin_?password)\s*[:=]\s*['\"](?:admin|password|123456|12345678|qwerty|letmein|welcome|test|test1234|changeme|default|root)['\"]", "HIGH", "credentials.hardcoded_default",
      "Hardcoded default/admin/test password in source",
      "Remove the hardcoded credential. Default credentials in source ship to production and are commonly tried by attackers. If this is a seed value for tests, move it into a test fixture directory (which Sentinel skips) and clearly name it as such."),
+
+    # ---- Hardcoded string used as route access gate ----
+    (r"req\.query\.\w+\s*!==?\s*['\"][A-Za-z0-9_\-]{4,30}['\"]", "HIGH", "auth.hardcoded_route_guard",
+     "Hardcoded string used as route access gate (query param comparison)",
+     "Replace the hardcoded access string with proper authentication. A literal string committed "
+     "to source code is not a secret — anyone with repo read access has it. It also appears in "
+     "plaintext in server access logs when passed as a query param. Use Supabase/JWT Bearer token "
+     "auth and verify the caller's role instead."),
+    (r"(?:const|let|var)\s+[A-Z_]{4,30}\s*=\s*['\"][A-Za-z0-9_\-]{4,20}['\"]", "HIGH",
+     "auth.hardcoded_route_guard_variable",
+     "Short uppercase constant assigned a literal string — possible hardcoded access gate",
+     "If this constant is used to gate route access (compared against req.query or req.body), "
+     "replace it with proper authentication. Literal strings in source code are not secrets — "
+     "anyone with repo read access can read the value. Use Supabase/JWT Bearer token auth instead."),
+
+    # ---- Weak password minimum length policy ----
+    (r"password\b.{0,30}\.length\s*<\s*([1-9]|1[01])\b", "HIGH", "auth.weak_password_minimum",
+     "Password minimum length below 12 characters",
+     "Increase the password minimum length to at least 12 characters for any app handling "
+     "sensitive data. NIST SP 800-63B recommends 8 as an absolute minimum; healthcare and "
+     "financial applications should use 12+. A 6-character minimum can be brute-forced offline "
+     "in seconds with modern hardware. Update the validation check and communicate the new "
+     "requirement to existing users."),
+
+    # ---- Open redirect (CWE-601, OWASP A01) ----
+    (r"res\.redirect\s*\(\s*(?:req\.(?:query|params|body))\.\w+", "HIGH", "injection.open_redirect",
+     "Open redirect — redirect target taken directly from request input",
+     "Validate the redirect URL against an explicit allowlist of trusted internal paths before "
+     "calling res.redirect(). Open redirects let attackers craft phishing URLs that appear to "
+     "originate from your domain. Never redirect to a URL taken verbatim from request "
+     "query/body/params. (CWE-601: URL Redirection to Untrusted Site)"),
+
+    # ---- Stack trace / raw error object in API response (CWE-200, OWASP A05) ----
+    (r"res\.(?:json|send)\s*\(\s*(?:err|error|e)\s*\)", "HIGH", "info_exposure.raw_error_in_response",
+     "Raw error object passed directly to res.json() / res.send()",
+     "Replace `res.json(err)` with a sanitized error response. Log the full error server-side "
+     "(Sentry/structured log), then return only a generic message: "
+     "`res.status(500).json({ error: 'Internal server error' })`. "
+     "Raw error objects expose file paths, dependency versions, and internal logic to attackers. "
+     "(CWE-200: Exposure of Sensitive Information)"),
+    (r"res\.(?:json|send)\s*\([^;]{0,150}\.stack\b", "CRITICAL", "info_exposure.stack_trace_in_response",
+     "Stack trace (`.stack`) sent in API response to client",
+     "Remove `.stack` from the response payload. Log stack traces server-side (Sentry or "
+     "structured logger), then return only a sanitized message: "
+     "`res.status(500).json({ error: 'Internal server error' })`. "
+     "A stack trace exposes your file system layout, library versions, and internal logic — "
+     "directly useful to an attacker. (CWE-200, OWASP A05 Security Misconfiguration)"),
+
+    # ---- Auth/session tokens in localStorage (OWASP A07) ----
+    (r"localStorage\.setItem\s*\(\s*['\"][^'\"]*(?:token|auth|session|jwt|access|refresh)[^'\"]*['\"]", "CRITICAL", "storage.auth_token_in_localstorage",
+     "Auth/session token written to localStorage — vulnerable to XSS theft",
+     "Move auth tokens to HttpOnly cookies. localStorage is accessible to any JavaScript on the "
+     "page — a single XSS vulnerability exposes every stored token. Use "
+     "`Set-Cookie: token=...; HttpOnly; Secure; SameSite=Strict` from the server instead. "
+     "This is item 'Do not keep auth tokens in local storage' from the security checklist."),
+
+    # ---- Client-side admin/role checks (OWASP A01) ----
+    (r"(?:isAdmin|is_admin|userRole|user\.role|currentUser\.role|session\.user\.role)\s*(?:===|==|!==|!=)\s*['\"](?:admin|superuser|root|staff|owner)['\"]", "HIGH", "auth.client_side_role_check",
+     "Admin/role check performed in client-side code",
+     "Role checks in client-side JavaScript are cosmetic — an attacker can bypass them in "
+     "browser DevTools in seconds. Move authorization decisions to the server. The client can "
+     "receive role-gated data from the API, but must not make security decisions based on "
+     "client-stored role values. (PDF checklist: 'Admin checks should not be happening on the client-side')"),
+
+    # ---- Mass assignment — spreading req.body into DB calls (OWASP A03) ----
+    (r"(?:create|update|save|insert|upsert)\s*\(\s*\{?\s*\.\.\.\s*req\.body", "HIGH", "injection.mass_assignment_spread",
+     "Mass assignment: spreading `req.body` directly into a create/update call",
+     "Never spread req.body directly into database writes. An attacker can inject unexpected "
+     "fields (e.g., `isAdmin: true`, `role: 'admin'`). Use an explicit allowlist: pick only "
+     "the fields you intend to write. (PDF checklist: 'Saving the whole request on updates is bad')"),
+    (r"\.(?:create|update|upsert|save)\s*\(\s*req\.body\s*\)", "HIGH", "injection.mass_assignment_direct",
+     "Mass assignment: `req.body` passed directly to a database method",
+     "Explicitly pick only the fields you expect: `const { name, email } = req.body; "
+     "model.update({ name, email })` instead of `model.update(req.body)`."),
+
+    # ---- Supabase public storage bucket ----
+    (r"(?:createBucket|updateBucket)\s*\([^)]*public\s*:\s*true", "HIGH", "misconfig.supabase_public_bucket",
+     "Supabase storage bucket set to `public: true`",
+     "Public buckets allow unauthenticated read access to all objects. Only use `public: true` "
+     "for genuinely public assets (e.g., marketing images). For user uploads or any "
+     "user-generated content, keep the bucket private and generate signed URLs for access. "
+     "(PDF checklist: 'Storage bucket is not supposed to be set to public')"),
+
+    # ---- Webhook missing signature verification (OWASP A08) ----
+    (r"(?:app|router)\.post\s*\(\s*['\"][^'\"]*(?:webhook|hook|callback|notify|event)[^'\"]*['\"]", "HIGH", "auth.webhook_no_signature",
+     "Webhook endpoint detected — verify it checks request signatures",
+     "Webhook endpoints must verify the provider's HMAC signature before processing. Without "
+     "this, any attacker can POST fake events and trigger business logic. Check for "
+     "`stripe.webhooks.constructEvent`, `svix.verify`, `crypto.timingSafeEqual`, or equivalent "
+     "before acting on the payload. (PDF checklist: 'Webhooks with no signature is bad')"),
+
+    # ---- Supabase service role key reference ----
+    (r"SUPABASE_SERVICE_ROLE(?:_KEY)?", "CRITICAL", "secrets.supabase_service_role",
+     "Supabase service role key referenced — must never reach the client",
+     "The Supabase service role key bypasses Row Level Security entirely. It must only exist "
+     "in server-side environment variables — never in client bundles, app.json, eas.json, or "
+     "any committed file. If it appears in client-accessible code, rotate it immediately via "
+     "the Supabase dashboard."),
 ]
 _compiled_injection = [
     (re.compile(pat), sev, rule, title, tell)
@@ -923,6 +1021,15 @@ MISCONFIG_PATTERNS = [
     (r"android:usesCleartextTraffic\s*=\s*['\"]true['\"]", "HIGH", "misconfig.cleartext_traffic",
      "Android cleartext traffic explicitly allowed",
      "Remove or set to `false`. `android:usesCleartextTraffic=\"true\"` disables Android's network security config protection against plain HTTP."),
+
+    # ---- Next.js source maps in production (CWE-540, OWASP A05) ----
+    (r"productionBrowserSourceMaps\s*:\s*true", "HIGH", "misconfig.source_maps_in_production",
+     "Next.js `productionBrowserSourceMaps: true` — source code exposed in production bundle",
+     "Remove `productionBrowserSourceMaps: true` from next.config.js. Source maps expose your "
+     "original TypeScript/JSX source, file paths, and business logic to anyone who opens "
+     "browser DevTools → Sources. If you need source maps for error tracking, upload them "
+     "privately to Sentry/Datadog and exclude them from the deployed bundle. "
+     "(CWE-540: Inclusion of Sensitive Information in Source Code)"),
 ]
 _compiled_misconfig = [
     (re.compile(pat), sev, rule, title, tell)
@@ -1264,6 +1371,708 @@ def _check_screen_capture_protection(root: Path, context: dict):
             "that decision in `project-context.md` so this finding can be dismissed in future audits."
         ),
     }]
+
+
+# ---- Security headers absence check (Next.js / web projects) ----
+
+_REQUIRED_SECURITY_HEADERS = [
+    ("Content-Security-Policy", "HIGH", "headers.csp_missing",
+     "Content-Security-Policy header not configured",
+     "Add a Content-Security-Policy header in next.config.js headers() or middleware.ts. "
+     "Without CSP, injected scripts execute freely in the browser. At minimum: "
+     "default-src 'self'; script-src 'self'; object-src 'none'; frame-ancestors 'none'."),
+    ("Strict-Transport-Security", "MEDIUM", "headers.hsts_missing",
+     "Strict-Transport-Security (HSTS) header not configured",
+     "Add `Strict-Transport-Security: max-age=63072000; includeSubDomains` to next.config.js "
+     "headers(). Without HSTS, browsers do not enforce HTTPS on return visits."),
+    ("X-Frame-Options", "MEDIUM", "headers.xfo_missing",
+     "X-Frame-Options header not configured",
+     "Add `X-Frame-Options: DENY` to next.config.js headers(). Without it, the app can be "
+     "embedded in an iframe on any domain — enabling clickjacking attacks."),
+    ("X-Content-Type-Options", "MEDIUM", "headers.xcto_missing",
+     "X-Content-Type-Options header not configured",
+     "Add `X-Content-Type-Options: nosniff` to next.config.js headers(). Without it, "
+     "browsers may MIME-sniff responses and treat a plain-text file as JavaScript."),
+    ("Referrer-Policy", "MEDIUM", "headers.referrer_missing",
+     "Referrer-Policy header not configured",
+     "Add `Referrer-Policy: strict-origin-when-cross-origin` to next.config.js headers(). "
+     "Without it, the full URL (which may contain sensitive IDs) is sent as a Referer "
+     "header to any external resource loaded by the page."),
+    ("Permissions-Policy", "LOW", "headers.permissions_policy_missing",
+     "Permissions-Policy header not configured",
+     "Add `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()` to "
+     "next.config.js headers(). Without it, browser features are unrestricted. "
+     "(PDF checklist: 'Add security headers')"),
+]
+
+_HSTS_INCLUDE_SUBDOMAINS = re.compile(r"includeSubDomains", re.IGNORECASE)
+
+
+def _check_security_headers(root: Path):
+    """Flag missing security headers in Next.js projects.
+    Checks next.config.js, next.config.ts, middleware.ts, and middleware.js.
+    Only fires for Next.js projects (next.config.* must exist).
+    Also checks that HSTS includes includeSubDomains when present.
+    """
+    has_nextconfig = (root / "next.config.js").exists() or (root / "next.config.ts").exists()
+    if not has_nextconfig:
+        return []
+
+    combined_text = ""
+    for fname in ["next.config.js", "next.config.ts", "middleware.ts", "middleware.js"]:
+        f = root / fname
+        if f.exists():
+            try:
+                combined_text += f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                pass
+
+    findings = []
+    for header_name, severity, rule, title, tell in _REQUIRED_SECURITY_HEADERS:
+        if header_name.lower() not in combined_text.lower():
+            findings.append({
+                "severity": severity,
+                "rule": rule,
+                "title": title,
+                "file": "next.config.js",
+                "line": 0,
+                "excerpt": f"('{header_name}' not found in next.config.js or middleware.ts)",
+                "tell_cursor": tell,
+            })
+
+    if "strict-transport-security" in combined_text.lower():
+        if not _HSTS_INCLUDE_SUBDOMAINS.search(combined_text):
+            findings.append({
+                "severity": "LOW",
+                "rule": "headers.hsts_no_subdomains",
+                "title": "Strict-Transport-Security present but missing `includeSubDomains`",
+                "file": "next.config.js",
+                "line": 0,
+                "excerpt": "(Strict-Transport-Security found; includeSubDomains not present)",
+                "tell_cursor": (
+                    "Update your HSTS header to include `includeSubDomains`: "
+                    "`Strict-Transport-Security: max-age=63072000; includeSubDomains`. "
+                    "Without it, subdomains can still be accessed over plain HTTP."
+                ),
+            })
+    return findings
+
+
+# ---- Rate limiting absence check (web API projects) ----
+
+_RATE_LIMIT_HINTS = re.compile(
+    r"\b(?:upstash/ratelimit|@upstash/ratelimit|express-rate-limit|rate-limiter-flexible|"
+    r"bottleneck|p-limit|ratelimit|RateLimit|rateLimiter|rate_limit)\b",
+    re.IGNORECASE,
+)
+
+
+def _check_rate_limiting(root: Path):
+    """Flag if no rate limiting library is detected in a project with API routes.
+    Only fires when pages/api or app/api directories exist.
+    (PDF checklist: 'Having no rate limiting on your endpoints is bad',
+    'Login endpoint and password reset has no rate limiting. This is bad')
+    """
+    api_dir = root / "pages" / "api"
+    app_api = root / "app" / "api"
+    if not api_dir.exists() and not app_api.exists():
+        return []
+
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            if _RATE_LIMIT_HINTS.search(pkg.read_text(encoding="utf-8", errors="ignore")):
+                return []
+        except Exception:
+            pass
+
+    for fname in ["middleware.ts", "middleware.js"]:
+        f = root / fname
+        if f.exists():
+            try:
+                if _RATE_LIMIT_HINTS.search(f.read_text(encoding="utf-8", errors="ignore")):
+                    return []
+            except Exception:
+                pass
+
+    return [{
+        "severity": "HIGH",
+        "rule": "security.rate_limiting_absent",
+        "title": "No rate limiting library detected in API project",
+        "file": "package.json",
+        "line": 0,
+        "excerpt": "(no @upstash/ratelimit / express-rate-limit / rate-limiter-flexible / similar found)",
+        "tell_cursor": (
+            "Add rate limiting to protect API routes from brute force, credential stuffing, "
+            "email bombing, and database connection exhaustion. For Next.js on Vercel, "
+            "@upstash/ratelimit with @upstash/redis is the standard approach. Apply stricter "
+            "limits to auth and email-sending routes; more lenient limits to general data routes."
+        ),
+    }]
+
+
+# ---- middleware.ts absence check (Next.js projects with API routes) ----
+
+def _check_nextjs_middleware_absent(root: Path):
+    """Flag if a Next.js project with API routes has no middleware.ts.
+    middleware.ts is where security headers, rate limiting, and auth redirects live.
+    """
+    has_nextconfig = (root / "next.config.js").exists() or (root / "next.config.ts").exists()
+    if not has_nextconfig:
+        return []
+    if (root / "middleware.ts").exists() or (root / "middleware.js").exists():
+        return []
+    api_dir = root / "pages" / "api"
+    app_api = root / "app" / "api"
+    if not api_dir.exists() and not app_api.exists():
+        return []
+    return [{
+        "severity": "HIGH",
+        "rule": "nextjs.middleware_absent",
+        "title": "No middleware.ts found in Next.js project with API routes",
+        "file": "(project root)",
+        "line": 0,
+        "excerpt": "(middleware.ts / middleware.js not found at project root)",
+        "tell_cursor": (
+            "Create middleware.ts at the project root. This is the standard Next.js location "
+            "for security headers (CSP, HSTS, X-Frame-Options), rate limiting, and auth "
+            "redirect logic. Without it, these protections must be applied manually in every "
+            "route handler — error-prone and easily missed."
+        ),
+    }]
+
+
+# ---- Service role key used in routes that lack auth checks ----
+
+_SERVICE_ROLE_HINTS = re.compile(
+    r"SUPABASE_SERVICE_ROLE_KEY|supabase_service_role|serviceRoleKey|service_role_key",
+    re.IGNORECASE,
+)
+_AUTH_CHECK_HINTS = re.compile(
+    r"authorization|Bearer|req\.headers\.auth|getUser|verifyJWT|resolveCallerFromToken",
+    re.IGNORECASE,
+)
+
+
+def _check_service_role_in_public_routes(root: Path):
+    """Flag API route files that use the Supabase service role key without any
+    Authorization header check. The service role key bypasses all RLS policies.
+    """
+    api_dirs = [root / "pages" / "api", root / "app" / "api"]
+    findings = []
+    for api_dir in api_dirs:
+        if not api_dir.exists():
+            continue
+        for path in api_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+                continue
+            rel = str(path.relative_to(root))
+            if _is_likely_test_file(rel):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if not _SERVICE_ROLE_HINTS.search(text):
+                continue
+            if _AUTH_CHECK_HINTS.search(text):
+                continue
+            findings.append({
+                "severity": "HIGH",
+                "rule": "auth.service_role_in_unauthed_route",
+                "title": "Supabase service role key used in route with no auth check",
+                "file": rel,
+                "line": 0,
+                "excerpt": "(service role key present; no Authorization/Bearer/getUser check found)",
+                "tell_cursor": (
+                    f"The file `{rel}` uses the Supabase service role key (which bypasses all "
+                    "RLS policies) but has no Authorization header check or session verification. "
+                    "Any unauthenticated caller can trigger this route with full database access. "
+                    "Either add a Bearer token auth check, or replace the service role key with "
+                    "the anon key if elevated privileges are not needed."
+                ),
+            })
+    return findings
+
+
+# ---- S3 presigned URLs without file size constraints ----
+
+_PRESIGNED_URL_HINTS = re.compile(r"getSignedUrl\s*\(", re.IGNORECASE)
+_CONTENT_LENGTH_HINTS = re.compile(r"ContentLengthRange|content.length.range", re.IGNORECASE)
+
+
+def _check_presigned_url_no_size_limit(root: Path):
+    """Flag files that generate S3 presigned upload URLs without a ContentLengthRange
+    condition. Without a size constraint, users can upload arbitrarily large files.
+    """
+    findings = []
+    for path in _walk_source_files(root):
+        rel = str(path.relative_to(root))
+        if _is_likely_test_file(rel):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not _PRESIGNED_URL_HINTS.search(text):
+            continue
+        if _CONTENT_LENGTH_HINTS.search(text):
+            continue
+        findings.append({
+            "severity": "MEDIUM",
+            "rule": "storage.presigned_url_no_size_limit",
+            "title": "S3 presigned upload URL generated without ContentLengthRange constraint",
+            "file": rel,
+            "line": 0,
+            "excerpt": "(getSignedUrl found; no ContentLengthRange condition detected)",
+            "tell_cursor": (
+                f"`{rel}` generates a presigned S3 upload URL with no file size limit. "
+                "An authenticated user can upload arbitrarily large files, causing unbounded "
+                "storage costs. Add a ContentLengthRange condition to the presigned POST policy. "
+                "Example: `Conditions: [['content-length-range', 1, 10485760]]` limits to 10MB."
+            ),
+        })
+    return findings
+
+
+# ---- Debug / internal endpoints without auth (CWE-306, OWASP A07) ----
+
+_DEBUG_ROUTE_NAME_RE = re.compile(
+    r"(?:^|[/\\])(?:debug|test-?api|internal|health-?check|admin-?test|diag(?:nostic)?s?|"
+    r"env-?(?:check|debug|info)|ping|whoami|info)\.[tj]sx?$",
+    re.IGNORECASE,
+)
+_ROUTE_AUTH_GUARD_RE = re.compile(
+    r"(?:authorization|Bearer|getUser|verifyJWT|resolveCallerFromToken|"
+    r"getServerSession|session\s*\?\.|req\.user\b|authenticate|isAuthenticated)",
+    re.IGNORECASE,
+)
+
+
+def _check_debug_endpoints(root: Path):
+    """Flag API route files whose filename matches debug/internal patterns but contain
+    no authentication check. (CWE-306: Missing Authentication for Critical Function)
+    """
+    api_dirs = [root / "pages" / "api", root / "app" / "api"]
+    findings = []
+    for api_dir in api_dirs:
+        if not api_dir.exists():
+            continue
+        for path in api_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+                continue
+            rel = str(path.relative_to(root))
+            if not _DEBUG_ROUTE_NAME_RE.search(rel.replace("\\", "/")):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            if _ROUTE_AUTH_GUARD_RE.search(text):
+                continue
+            findings.append({
+                "severity": "HIGH",
+                "rule": "auth.debug_endpoint_no_auth",
+                "title": f"Debug/internal endpoint `{rel}` has no authentication guard",
+                "file": rel,
+                "line": 0,
+                "excerpt": "(route filename matches debug/internal pattern; no auth check detected)",
+                "tell_cursor": (
+                    f"`{rel}` appears to be a debug or internal diagnostic endpoint but has no "
+                    "authentication check. These routes commonly expose environment variables, "
+                    "stack traces, or internal state to any unauthenticated caller. "
+                    "Either delete the endpoint if no longer needed (preferred), or add auth: "
+                    "verify a Bearer token or server session before returning any information. "
+                    "(CWE-306: Missing Authentication for Critical Function)"
+                ),
+            })
+    return findings
+
+
+# ---- Verbose error / stack trace in API response (function-level scan) ----
+
+_VERBOSE_ERROR_RE = re.compile(
+    r"(?:json|send)\s*\(\s*\{[^}]{0,300}(?:stack|err\.stack|error\.stack)\s*:",
+    re.IGNORECASE | re.DOTALL,
+)
+_RAW_ERROR_SEND_RE = re.compile(
+    r"res\.(?:json|send)\s*\(\s*(?:err|error|exception|e)\s*\)",
+    re.IGNORECASE,
+)
+
+
+def _check_verbose_error_responses(root: Path):
+    """Flag API route files that appear to send stack traces or raw error objects
+    back to HTTP clients. (CWE-200, OWASP A05)
+    """
+    api_dirs = [root / "pages" / "api", root / "app" / "api"]
+    findings = []
+    for api_dir in api_dirs:
+        if not api_dir.exists():
+            continue
+        for path in api_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+                continue
+            rel = str(path.relative_to(root))
+            if _is_likely_test_file(rel):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            hit = _VERBOSE_ERROR_RE.search(text) or _RAW_ERROR_SEND_RE.search(text)
+            if not hit:
+                continue
+            findings.append({
+                "severity": "HIGH",
+                "rule": "info_exposure.verbose_error_in_response",
+                "title": f"Possible stack trace or raw error object sent in API response: `{rel}`",
+                "file": rel,
+                "line": 0,
+                "excerpt": hit.group(0)[:200],
+                "tell_cursor": (
+                    f"`{rel}` appears to return a raw error object or stack trace to the HTTP "
+                    "client. Log the full error server-side (Sentry or structured logger), then "
+                    "return only a sanitized generic message: "
+                    "`res.status(500).json({ error: 'Internal server error' })`. "
+                    "Stack traces expose file system layout and library versions to attackers. "
+                    "(CWE-200, OWASP A05 — PDF checklist: 'Production stack traces are bad')"
+                ),
+            })
+    return findings
+
+
+# ---- Next.js CVE-2025-29927 (middleware auth bypass, CVSS 9.1) ----
+
+def _check_nextjs_vulnerable_version(root: Path):
+    """Check if the declared Next.js version is vulnerable to CVE-2025-29927,
+    a critical middleware authorization bypass (CVSS 9.1).
+    Affected: 11.x–13.5.8, 14.x < 14.2.25, 15.x < 15.2.3.
+    """
+    pkg = root / "package.json"
+    if not pkg.exists():
+        return []
+    try:
+        text = pkg.read_text(encoding="utf-8", errors="ignore")
+        data = json.loads(text)
+    except Exception:
+        return []
+
+    next_version_str = (
+        (data.get("dependencies") or {}).get("next") or
+        (data.get("devDependencies") or {}).get("next")
+    )
+    if not next_version_str:
+        return []
+
+    clean = re.sub(r"^[^0-9]*", "", next_version_str).strip()
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", clean)
+    if not m:
+        return []
+
+    try:
+        major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except ValueError:
+        return []
+
+    is_vulnerable = False
+    if major == 15 and (minor, patch) < (2, 3):
+        is_vulnerable = True
+    elif major == 14 and (minor, patch) < (2, 25):
+        is_vulnerable = True
+    elif major == 13 and (minor, patch) < (5, 9):
+        is_vulnerable = True
+    elif major == 12 and (minor, patch) < (3, 5):
+        is_vulnerable = True
+    elif major <= 11:
+        is_vulnerable = True
+
+    if not is_vulnerable:
+        return []
+
+    patched_map = {15: "15.2.3", 14: "14.2.25", 13: "13.5.9", 12: "12.3.5"}
+    patched = patched_map.get(major, "latest")
+
+    return [{
+        "severity": "CRITICAL",
+        "rule": "cve.nextjs_cve_2025_29927",
+        "title": f"Next.js {clean} is vulnerable to CVE-2025-29927 — middleware auth bypass (CVSS 9.1)",
+        "file": "package.json",
+        "line": 0,
+        "excerpt": f'"next": "{next_version_str}" — patched version: {patched}',
+        "tell_cursor": (
+            f"Upgrade Next.js to {patched} or later immediately. "
+            "CVE-2025-29927 allows an unauthenticated attacker to bypass ALL middleware-based "
+            "auth by adding a single request header (`x-middleware-subrequest`). Login walls, "
+            "role checks, and security headers applied via middleware are completely bypassed. "
+            f"Run: `npm install next@{patched}`"
+        ),
+    }]
+
+
+# ---- Security logging / monitoring absent (OWASP A09) ----
+
+_LOGGING_LIB_RE = re.compile(
+    r"\b(?:@sentry/nextjs|@sentry/node|@sentry/react|sentry|winston|pino|bunyan|morgan|"
+    r"dd-trace|datadog|newrelic|new-relic|logtail|axiom|logflare|papertrail|rollbar|"
+    r"@logtail|@axiom|@datadog/browser-logs|highlight\.run|betterstack)\b",
+    re.IGNORECASE,
+)
+
+
+def _check_security_logging_absent(root: Path):
+    """Flag if no structured logging or error-monitoring library is detected in a
+    Next.js/web project. Required by OWASP A09:2021.
+    """
+    has_nextconfig = (root / "next.config.js").exists() or (root / "next.config.ts").exists()
+    has_pages = (root / "pages").exists() or (root / "app").exists()
+    if not has_nextconfig and not has_pages:
+        return []
+
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            if _LOGGING_LIB_RE.search(pkg.read_text(encoding="utf-8", errors="ignore")):
+                return []
+        except Exception:
+            pass
+
+    for fname in [
+        "instrumentation.ts", "instrumentation.js",
+        "sentry.client.config.ts", "sentry.client.config.js",
+        "sentry.server.config.ts", "sentry.server.config.js",
+    ]:
+        if (root / fname).exists():
+            return []
+
+    return [{
+        "severity": "HIGH",
+        "rule": "monitoring.security_logging_absent",
+        "title": "No security logging / error monitoring library detected (OWASP A09)",
+        "file": "package.json",
+        "line": 0,
+        "excerpt": "(no Sentry, Winston, Pino, Datadog, Rollbar, or equivalent found)",
+        "tell_cursor": (
+            "Add structured error logging and monitoring. For Next.js on Vercel, Sentry is "
+            "the standard: `npx @sentry/wizard@latest -i nextjs`. Without monitoring, security "
+            "incidents — auth failures, injection attempts, unusual access patterns — are "
+            "invisible until after damage occurs. (OWASP A09:2021)"
+        ),
+    }]
+
+
+# ---- Session cookie security flags (CWE-614, CWE-1004) ----
+
+_COOKIE_SET_HINTS = re.compile(
+    r"(?:res\.setHeader\s*\(\s*['\"]Set-Cookie['\"]|"
+    r"\.cookie\s*\(['\"][^'\"]+['\"],\s*[^,]+,\s*\{|"
+    r"serialize\s*\(['\"][^'\"]+['\"],\s*[^,]+,\s*\{)",
+    re.IGNORECASE,
+)
+_COOKIE_HTTPONLY_RE = re.compile(r"httpOnly\s*:\s*true", re.IGNORECASE)
+_COOKIE_SECURE_RE = re.compile(r"(?<!\w)secure\s*:\s*true", re.IGNORECASE)
+_COOKIE_SAMESITE_RE = re.compile(r"sameSite\s*:", re.IGNORECASE)
+
+
+def _check_session_cookie_flags(root: Path):
+    """Flag files that set session/auth cookies without httpOnly, Secure, and SameSite flags.
+    (CWE-614: Sensitive Cookie Without Secure Attribute; CWE-1004: Missing HttpOnly)
+    (PDF checklist: 'Secure session cookies', 'Session tokens are stored in local storage. This is bad')
+    """
+    findings = []
+    for path in _walk_source_files(root):
+        rel = str(path.relative_to(root))
+        if _is_likely_test_file(rel):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not _COOKIE_SET_HINTS.search(text):
+            continue
+        missing = []
+        if not _COOKIE_HTTPONLY_RE.search(text):
+            missing.append("httpOnly: true")
+        if not _COOKIE_SECURE_RE.search(text):
+            missing.append("secure: true")
+        if not _COOKIE_SAMESITE_RE.search(text):
+            missing.append("sameSite: 'Lax'")
+        if not missing:
+            continue
+        findings.append({
+            "severity": "HIGH",
+            "rule": "auth.cookie_missing_security_flags",
+            "title": f"Session cookie set without security flags in `{rel}`",
+            "file": rel,
+            "line": 0,
+            "excerpt": f"(cookie operation detected; missing flags: {', '.join(missing)})",
+            "tell_cursor": (
+                f"`{rel}` sets a cookie but is missing: {', '.join(missing)}. "
+                "Missing `httpOnly` allows JavaScript to read the session cookie (XSS → theft). "
+                "Missing `secure` allows the cookie over plain HTTP. "
+                "Missing `sameSite` leaves sessions vulnerable to CSRF. "
+                "Correct example: `serialize('session', token, { httpOnly: true, secure: true, "
+                "sameSite: 'Lax', path: '/', maxAge: 1800 })`. (CWE-614)"
+            ),
+        })
+    return findings
+
+
+# ---- HIPAA: automatic logoff / session expiry absent (§164.312(a)(2)(iii)) ----
+
+_SESSION_TIMEOUT_RE = re.compile(
+    r"(?:maxAge|session_?max_?age|sessionTimeout|session_timeout|"
+    r"MAX_AGE|SESSION_DURATION|idleTimeout|idle_timeout)\b",
+    re.IGNORECASE,
+)
+_AUTH_RELATED_FILE_RE = re.compile(
+    r"(?:auth|session|next-?auth|middleware|login|signin)\.[tj]sx?$",
+    re.IGNORECASE,
+)
+
+
+def _check_auto_logoff_absent(root: Path, context: dict):
+    """Flag HIPAA-declared projects with no session maxAge / expiry configuration.
+    HIPAA §164.312(a)(2)(iii) requires automatic logoff after inactivity.
+    """
+    if not context.get("found"):
+        return []
+    if "hipaa" not in " ".join(context.get("compliance", [])).lower():
+        return []
+
+    for path in _walk_source_files(root):
+        rel = str(path.relative_to(root))
+        if _is_likely_test_file(rel):
+            continue
+        if not _AUTH_RELATED_FILE_RE.search(rel.replace("\\", "/")):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if _SESSION_TIMEOUT_RE.search(text):
+            return []
+
+    return [{
+        "severity": "HIGH",
+        "rule": "hipaa.auto_logoff_absent",
+        "title": "HIPAA project: no session expiry / automatic logoff configuration detected",
+        "file": "(auth config files)",
+        "line": 0,
+        "excerpt": "(no maxAge / sessionTimeout / idleTimeout found in auth-related files)",
+        "tell_cursor": (
+            "HIPAA §164.312(a)(2)(iii) requires automatic logoff after inactivity. "
+            "For NextAuth.js: add `session: { maxAge: 1800 }` (30 minutes) in your auth config. "
+            "Also implement a client-side inactivity timer that logs out after 15–30 minutes."
+        ),
+    }]
+
+
+# ---- HIPAA: Cache-Control no-store on API routes (§164.312(e)(1)) ----
+
+_CACHE_NOSTORE_RE = re.compile(r"no.?store", re.IGNORECASE)
+_CACHE_HEADER_SET_RE = re.compile(
+    r"(?:setHeader|headers)\s*\([^)]*Cache-Control",
+    re.IGNORECASE,
+)
+
+
+def _check_phi_no_cache_control(root: Path, context: dict):
+    """Flag HIPAA-declared projects where API routes do not set Cache-Control: no-store.
+    HIPAA §164.312(e)(1) — Transmission Security.
+    """
+    if not context.get("found"):
+        return []
+    if "hipaa" not in " ".join(context.get("compliance", [])).lower():
+        return []
+
+    api_dirs = [root / "pages" / "api", root / "app" / "api"]
+    routes_checked = 0
+    routes_missing = []
+
+    for api_dir in api_dirs:
+        if not api_dir.exists():
+            continue
+        for path in api_dir.rglob("*"):
+            if path.is_dir():
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"}:
+                continue
+            rel = str(path.relative_to(root))
+            if _is_likely_test_file(rel):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            routes_checked += 1
+            has_header = _CACHE_HEADER_SET_RE.search(text)
+            has_nostore = _CACHE_NOSTORE_RE.search(text)
+            if has_header and has_nostore:
+                continue
+            routes_missing.append(rel)
+
+    if not routes_checked or not routes_missing:
+        return []
+    if len(routes_missing) < max(2, routes_checked // 3):
+        return []
+
+    return [{
+        "severity": "HIGH",
+        "rule": "hipaa.phi_no_cache_control",
+        "title": "HIPAA project: API routes missing Cache-Control: no-store",
+        "file": routes_missing[0] if len(routes_missing) == 1 else "(multiple API routes)",
+        "line": 0,
+        "excerpt": f"({len(routes_missing)} of {routes_checked} API routes lack Cache-Control: no-store)",
+        "tell_cursor": (
+            f"{len(routes_missing)} of {routes_checked} API routes do not set "
+            "`Cache-Control: no-store`. For a HIPAA application, all API responses returning "
+            "ePHI must prevent caching. Add to every route: "
+            "`res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private')`. "
+            "(HIPAA §164.312(e)(1) — Transmission Security)"
+        ),
+    }]
+
+
+# ---- Next.js: X-Powered-By header not suppressed ----
+
+def _check_powered_by_header(root: Path):
+    """Flag Next.js projects that do not disable the X-Powered-By: Next.js response header.
+    This header reveals the framework name and version, enabling targeted CVE attacks.
+    """
+    for fname in ["next.config.js", "next.config.ts"]:
+        f = root / fname
+        if not f.exists():
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            if re.search(r"poweredByHeader\s*:\s*false", text):
+                return []
+        except Exception:
+            pass
+    for fname in ["next.config.js", "next.config.ts"]:
+        if (root / fname).exists():
+            return [{
+                "severity": "LOW",
+                "rule": "misconfig.powered_by_header_not_disabled",
+                "title": "Next.js `poweredByHeader` not disabled — X-Powered-By header leaks framework identity",
+                "file": fname,
+                "line": 0,
+                "excerpt": "(`poweredByHeader: false` not found in next.config.js)",
+                "tell_cursor": (
+                    "Add `poweredByHeader: false` to next.config.js. This suppresses the "
+                    "`X-Powered-By: Next.js` response header, which reveals your framework "
+                    "and aids attackers in targeting known CVEs. "
+                    "Fix: add `poweredByHeader: false` to the exported config object."
+                ),
+            }]
+    return []
 
 
 # ---- Permissions audit (OWASP Mobile M6 Privacy Controls) ----
@@ -1965,6 +2774,84 @@ def sentinel_pass2_audit(
     findings.extend(screen_hits)
     if not screen_hits and context.get("found") and context.get("sensitive_fields"):
         passed.append("Screen-capture/recording protection found in code (sensitive screens can opt in).")
+
+    # --- Security headers (Next.js / web projects) ---
+    header_hits = _check_security_headers(root)
+    findings.extend(header_hits)
+    if not header_hits and ((root / "next.config.js").exists() or (root / "next.config.ts").exists()):
+        passed.append("Required security headers (CSP, HSTS, X-Frame-Options, etc.) found in config.")
+
+    # --- Rate limiting ---
+    rate_hits = _check_rate_limiting(root)
+    findings.extend(rate_hits)
+    if not rate_hits:
+        passed.append("Rate limiting library detected (or no API routes found).")
+
+    # --- middleware.ts presence (Next.js) ---
+    mw_hits = _check_nextjs_middleware_absent(root)
+    findings.extend(mw_hits)
+    if not mw_hits and ((root / "middleware.ts").exists() or (root / "middleware.js").exists()):
+        passed.append("middleware.ts present — security headers and rate limiting can be applied globally.")
+
+    # --- Service role key in unauthenticated routes ---
+    svc_hits = _check_service_role_in_public_routes(root)
+    findings.extend(svc_hits)
+    if not svc_hits:
+        passed.append("No service role key usage detected in unauthenticated API routes.")
+
+    # --- S3 presigned URLs without size constraints ---
+    presigned_hits = _check_presigned_url_no_size_limit(root)
+    findings.extend(presigned_hits)
+    if not presigned_hits:
+        passed.append("S3 presigned URL size constraints detected or no presigned URLs in use.")
+
+    # --- Debug endpoints without authentication (CWE-306) ---
+    debug_hits = _check_debug_endpoints(root)
+    findings.extend(debug_hits)
+    if not debug_hits:
+        passed.append("No unauthenticated debug/internal API endpoints detected.")
+
+    # --- Verbose error / stack trace in API responses (CWE-200) ---
+    verbose_err_hits = _check_verbose_error_responses(root)
+    findings.extend(verbose_err_hits)
+    if not verbose_err_hits:
+        passed.append("No obvious stack trace or raw error object exposure in API responses.")
+
+    # --- Next.js CVE-2025-29927 (middleware auth bypass, CVSS 9.1) ---
+    cve_hits = _check_nextjs_vulnerable_version(root)
+    findings.extend(cve_hits)
+    if not cve_hits:
+        passed.append("Next.js version not vulnerable to CVE-2025-29927 (or not a Next.js project).")
+
+    # --- Security logging / monitoring absent (OWASP A09) ---
+    logging_hits = _check_security_logging_absent(root)
+    findings.extend(logging_hits)
+    if not logging_hits:
+        passed.append("Security logging / monitoring library detected.")
+
+    # --- Session cookie security flags (CWE-614, CWE-1004) ---
+    cookie_hits = _check_session_cookie_flags(root)
+    findings.extend(cookie_hits)
+    if not cookie_hits:
+        passed.append("No cookie operations found missing httpOnly/Secure/SameSite flags.")
+
+    # --- HIPAA: automatic logoff / session expiry (§164.312(a)(2)(iii)) ---
+    logoff_hits = _check_auto_logoff_absent(root, context)
+    findings.extend(logoff_hits)
+    if not logoff_hits:
+        passed.append("Session expiry / auto-logoff config detected (or HIPAA not declared).")
+
+    # --- HIPAA: Cache-Control no-store on API routes (§164.312(e)(1)) ---
+    cache_hits = _check_phi_no_cache_control(root, context)
+    findings.extend(cache_hits)
+    if not cache_hits:
+        passed.append("Cache-Control: no-store present on API routes (or HIPAA not declared).")
+
+    # --- Next.js powered-by header not suppressed ---
+    powered_by_hits = _check_powered_by_header(root)
+    findings.extend(powered_by_hits)
+    if not powered_by_hits:
+        passed.append("Next.js poweredByHeader disabled or not a Next.js project.")
 
     # --- Gather context for LLM judgment ---
     routes = _gather_api_routes(root)
