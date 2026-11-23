@@ -492,6 +492,153 @@ def _check_env_in_gitignore(root: Path):
     return findings
 
 
+# ====================================================================
+# Repository access (Git / GitHub) — read-only, never prints secret values
+# ====================================================================
+
+_GIT_KEY_FILE_RE = re.compile(r"(?:^|/)(id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|[^/]+\.pem|[^/]+\.p12|[^/]+\.pfx)$", re.IGNORECASE)
+_GIT_URL_CREDS_RE = re.compile(r"^https?://[^/@\s]+@", re.IGNORECASE)
+
+
+def _redact_git_url(url: str) -> str:
+    return re.sub(r"//[^/@\s]+@", "//***@", url)
+
+
+def _check_git_repo_access(root: Path):
+    """How the project authenticates to its Git remote, plus key/credential hygiene.
+    Read-only. Never emits a token, key, or credential file's contents.
+    """
+    findings = []
+    if not (root / ".git").exists():
+        return findings
+
+    def _git(args):
+        return subprocess.run(["git"] + args, cwd=str(root), capture_output=True, text=True, timeout=10)
+
+    # 1. Remote URLs: SSH vs HTTPS, and credentials embedded in the URL
+    try:
+        remotes = _git(["remote", "-v"])
+        seen = set()
+        if remotes.returncode == 0:
+            for line in remotes.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                name, url = parts[0], parts[1]
+                if (name, url) in seen:
+                    continue
+                seen.add((name, url))
+                safe = _redact_git_url(url)
+                if _GIT_URL_CREDS_RE.match(url):
+                    findings.append({
+                        "severity": "HIGH",
+                        "rule": "repo.remote_url_embeds_credentials",
+                        "title": f"Git remote '{name}' URL embeds credentials",
+                        "file": ".git/config",
+                        "line": 0,
+                        "excerpt": f"{name} {safe}",
+                        "tell_cursor": (
+                            f"Remote '{name}' has a username/token inside its URL. Revoke that token on GitHub now, then run "
+                            f"`git remote set-url {name} git@github.com:<owner>/<repo>.git` to switch to SSH. "
+                            "Do not paste the old URL anywhere."
+                        ),
+                    })
+                elif url.lower().startswith(("https://", "http://")):
+                    findings.append({
+                        "severity": "MEDIUM",
+                        "rule": "repo.remote_uses_https",
+                        "title": f"Git remote '{name}' uses HTTPS instead of SSH",
+                        "file": ".git/config",
+                        "line": 0,
+                        "excerpt": f"{name} {safe}",
+                        "tell_cursor": (
+                            "HTTPS remotes rely on a saved password or long-lived personal access token. Prefer an SSH key (ed25519): "
+                            f"run `git remote set-url {name} git@github.com:<owner>/<repo>.git` after adding your public key in GitHub "
+                            "Settings > SSH and GPG keys."
+                        ),
+                    })
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # 2. Plaintext credential storage
+    if (root / ".git-credentials").exists():
+        findings.append({
+            "severity": "HIGH",
+            "rule": "repo.git_credentials_file",
+            "title": ".git-credentials file present in project folder",
+            "file": ".git-credentials",
+            "line": 0,
+            "excerpt": "(file exists; contents not read)",
+            "tell_cursor": "Delete .git-credentials from the project, revoke any token it held, and add it to .gitignore.",
+        })
+    try:
+        helper = _git(["config", "--get-all", "credential.helper"])
+        if helper.returncode == 0 and any(h.strip().split()[:1] == ["store"] for h in helper.stdout.splitlines()):
+            findings.append({
+                "severity": "HIGH",
+                "rule": "repo.credential_helper_store",
+                "title": "git credential.helper is 'store' (plaintext credentials on disk)",
+                "file": ".git/config",
+                "line": 0,
+                "excerpt": "credential.helper = store",
+                "tell_cursor": (
+                    "Run `git config --unset-all credential.helper` and use SSH keys or the macOS keychain helper "
+                    "(`osxkeychain`) instead. Revoke any token that was stored in plaintext."
+                ),
+            })
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    # 3. Private keys tracked by git or sitting inside the project folder
+    tracked = set()
+    try:
+        ls = _git(["ls-files"])
+        if ls.returncode == 0:
+            for rel in ls.stdout.splitlines():
+                if _GIT_KEY_FILE_RE.search(rel):
+                    tracked.add(rel)
+                    findings.append({
+                        "severity": "HIGH",
+                        "rule": "repo.key_file_tracked",
+                        "title": "Private key / certificate file is tracked by git",
+                        "file": rel,
+                        "line": 0,
+                        "excerpt": "(file tracked; contents not read)",
+                        "tell_cursor": (
+                            f"Run `git rm --cached {rel}`, add it to .gitignore, and treat the key as compromised: "
+                            "rotate it. It remains in git history until the history is rewritten."
+                        ),
+                    })
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass
+
+    try:
+        for dirpath, dirnames, filenames in __import__("os").walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d not in (".git", ".venv", "venv")]
+            for fn in filenames:
+                full = Path(dirpath) / fn
+                rel = str(full.relative_to(root))
+                if rel in tracked:
+                    continue
+                if _GIT_KEY_FILE_RE.search(rel):
+                    findings.append({
+                        "severity": "MEDIUM",
+                        "rule": "repo.key_file_in_project",
+                        "title": "Private key / certificate file inside the project folder",
+                        "file": rel,
+                        "line": 0,
+                        "excerpt": "(file present; contents not read)",
+                        "tell_cursor": (
+                            f"Move {rel} out of the project folder (keys belong in ~/.ssh or a secrets manager) and make sure "
+                            "*.pem, id_* and *.p12 are in .gitignore."
+                        ),
+                    })
+    except Exception:
+        pass
+
+    return findings
+
+
 def _check_file_size(root: Path, threshold: int = 200):
     findings = []
     for path in _walk_source_files(root):
@@ -2688,6 +2835,11 @@ def sentinel_pass2_audit(
     findings.extend(env_check)
     if not env_check:
         passed.append(".gitignore covers .env, .env.local, .env.production.")
+
+    git_access = _check_git_repo_access(root)
+    findings.extend(git_access)
+    if not git_access and (root / ".git").exists():
+        passed.append("Git remote uses SSH with no embedded credentials, plaintext credential storage, or key files tracked/in project.")
 
     size = _check_file_size(root)
     findings.extend(size)

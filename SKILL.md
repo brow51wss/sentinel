@@ -112,6 +112,14 @@ If the MCP is running, these rule families execute automatically. If you are run
 - Default/admin/test passwords (`"admin"`, `"password"`, `"123456"`, etc.) in non-test files
 - Secrets in `*.plist`, `*.xml`, `*.json`, `*.yml`, `*.yaml`, `app.json`, `eas.json`
 
+### Repository access — Git / GitHub (read-only; never print a secret value)
+- `git remote -v`: report whether the project authenticates over SSH (`git@github.com:...`) or HTTPS. HTTPS with a saved password or long-lived personal access token is MEDIUM; fix is to switch the remote to SSH.
+- HIGH: any remote URL that embeds credentials (`https://user:token@github.com/...`), a `.git-credentials` file, `credential.helper store` (plaintext storage), or a token/private key found in the repo or its history. Report file and line only, never the value.
+- Private keys must not be inside the project folder, and no `id_*`, `*.pem`, `*.p12` file may be tracked by git (tracked = HIGH, present but untracked = MEDIUM).
+- If SSH is used: key type (ed25519 preferred), key not shared between people, and whether it is a deploy key (read-only unless pushes are needed).
+- Judgment / cannot be observed by the MCP — ask the developer to confirm in GitHub and mark each **REPORTED, not OBSERVED**: repository is private, two-step sign-in is on for every account with access, force-push and deletion of the main branch are blocked, and a person who leaves loses access.
+- Never run a command that prints a token, key, or credential file's contents; list names, paths and dates only.
+
 ### Injection sinks (OWASP Mobile M4, OWASP A3)
 - `dangerouslySetInnerHTML` use
 - `eval`, `new Function`, `setTimeout`/`setInterval` with string args
